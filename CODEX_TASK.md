@@ -4,7 +4,7 @@ Build StarzYGiftWatch from this repository contract. Keep it lightweight and pro
 
 ## Deliverables
 
-Implement roughly this shape (adjust names only when it materially simplifies things):
+Implement roughly this shape (rename only when it materially simplifies things):
 
 ```text
 starzygiftwatch/
@@ -25,77 +25,124 @@ tests/
 .github/workflows/ci.yml
 ```
 
+## Configuration model
+
+Keep one clear source of truth:
+
+- env file: `BOT_TOKEN`, `ADMIN_ID`, `DATABASE_PATH`, `LOG_LEVEL` only;
+- SQLite runtime settings: watcher enabled flag and poll interval (default 5s, valid 2..3600s), plus health/baseline/events.
+
+Telegram admin and terminal `watch` must change the same SQLite runtime settings. Do not require a service restart just to change watcher ON/OFF or poll interval.
+
 ## Core behavior
 
 1. Use aiogram's official Bot API support for `getAvailableGifts`.
-2. Poll on a configurable interval, default 5s, validated to a safe range (2..3600s).
-3. First successful response becomes a durable baseline with no NEW alerts.
-4. Normalize each Gift into JSON-safe data keyed by gift ID. Preserve relevant official fields, including price and limited/personal counts, and safely include newly exposed simple serializable fields.
-5. Compare successful snapshots and create durable events for:
-   - new gift ID (highest priority)
-   - removed/unavailable gift ID
-   - price change
-   - total/remaining global count change
-   - total/remaining personal count change
-   - other meaningful normalized field changes
-6. Ignore ordering-only differences.
-7. Event table has a deterministic fingerprint/unique constraint. Commit event before Telegram send.
-8. Alert worker sends pending events to `ADMIN_ID`; mark sent only after success. Retry transient failures with bounded exponential backoff; honor Telegram `retry_after` exactly/conservatively.
-9. Watcher ON/OFF is durable. Disabling polling must not destroy baseline/history.
-10. SQLite WAL, schema versioning/migration small enough for v1, short transactions, no network I/O inside write transactions.
+2. Poll at the durable configured interval.
+3. First successful response becomes baseline and creates no NEW events.
+4. Normalize by Gift ID into deterministic JSON-safe snapshots. Explicitly preserve official semantic fields such as `id`, `star_count`, `upgrade_star_count`, premium/color flags, `total_count`, `remaining_count`, `personal_total_count`, `personal_remaining_count`, background/variant/publisher metadata when safely serializable. Do not let unstable media/file payload details create noisy false changes.
+5. New Gift ID is the highest-priority event and alerts on the first successful poll where it appears.
+6. Price, total supply, personal limits, sold-out/availability and meaningful stable-field changes create durable events.
+7. Normal global `remaining_count` decrements are high-churn sales telemetry: update the snapshot/history but do not alert on every decrement. Notify meaningful transitions such as an increase/restock or reaching zero/sold-out.
+8. A missing Gift ID is not announced as removed until it is absent from two consecutive successful polls. A failed poll never counts toward removal confirmation.
+9. Ordering-only differences create no event.
+10. Apply each successful catalog atomically in SQLite: event inserts/dedupe and snapshot replacement/version update must commit together. This is required so a crash cannot save the new snapshot while losing its NEW event.
+11. Event fingerprints are deterministic and uniquely constrained. Commit before Telegram delivery.
+12. Alert worker sends pending events to `ADMIN_ID`, marks sent only after success, honors `TelegramRetryAfter.retry_after`, and uses bounded exponential backoff + jitter otherwise.
+13. Watcher OFF stops catalog polling only; it must not destroy baseline/history and must not prevent pending alert retries.
+14. SQLite: WAL, foreign keys, practical busy timeout, schema versioning, short write transactions, no network I/O inside write transactions.
+15. Document the unavoidable at-least-once notification window: crash after Telegram accepts an alert but before local `sent` commit may duplicate that alert once.
+
+## Baseline rebuild
+
+Both Telegram and CLI rebuild actions require confirmation. Rebuild must:
+
+- fetch Telegram first;
+- if fetch fails, keep the previous baseline unchanged;
+- atomically replace the baseline on success;
+- create no fake NEW events from the rebuild itself;
+- preserve event history and pending alerts.
 
 ## Telegram admin UI
 
-Owner-only. `/start` or `/admin` opens a compact inline panel with watcher status, last successful poll, interval, gift count, pending alert count and last change. Include controls for ON/OFF, interval, current gifts, recent changes, test alert and confirmed baseline rebuild. Non-admin users get no admin panel.
+Owner-only. `/start` or `/admin` opens a compact inline panel showing watcher state, last successful poll, interval, gift count, pending alerts and last change. Include ON/OFF, interval, current gifts, recent changes, test alert and confirmed baseline rebuild.
+
+Re-check `ADMIN_ID` on every command and callback. Non-admin users get no admin controls.
 
 ## Terminal `watch` menu
 
-Create a friendly numbered menu callable from any directory after install. It must configure Bot Token, Admin ID and interval; show service/health; enable/disable watcher; show baseline; send test alert; rebuild baseline with confirmation; show recent logs; restart service; exit. Mask token output.
+Friendly numbered menu callable from any directory. It must:
 
-Important: system `/usr/bin/watch` already exists. Install `/usr/local/bin/watch` wrapper without deleting it. No args launch our CLI. Any args must `exec` the original watch binary with the exact argument vector.
+- set/validate Bot Token and Admin ID;
+- set poll interval;
+- show service/health;
+- watcher ON/OFF;
+- baseline summary;
+- test alert;
+- confirmed baseline rebuild;
+- recent logs;
+- restart service;
+- exit.
+
+Mask the token.
+
+System `/usr/bin/watch` must remain intact. Install `/usr/local/bin/watch` so:
+
+- no args -> our CLI;
+- any args -> `exec` the original system watch with the exact original arguments and exit behavior.
+
+Do not let CLI/root operations leave SQLite, WAL or SHM files unwritable by the `starzygiftwatch` service user.
 
 ## Installer
 
-`install.sh` is idempotent for Ubuntu/Debian. It should:
+`install.sh` is idempotent for Ubuntu/Debian and supports being executed directly from the README curl one-liner. It should:
 
-- require/elevate to root cleanly;
-- install minimal OS prerequisites (`python3`, venv, git/curl as needed);
-- install/update repository at `/opt/starzygiftwatch`;
-- create `.venv` and install pinned Python requirements;
-- create `starzygiftwatch` system user and `/opt/starzygiftwatch/data` ownership;
-- create `/etc/starzygiftwatch.env` if absent and preserve existing values on rerun;
-- install systemd unit with practical hardening and writable data path;
-- install the compatibility `watch` wrapper;
-- run lightweight self-checks;
-- do not start a restart loop when token/admin config is missing;
+- elevate/require root cleanly;
+- install minimal OS prerequisites;
+- clone/update this repo at `/opt/starzygiftwatch` without touching StarzYFire;
+- create `.venv` and install pinned tested requirements;
+- create the dedicated `starzygiftwatch` system user and writable data directory;
+- create `/etc/starzygiftwatch.env` if absent and preserve existing secrets on rerun;
+- install a systemd unit with practical, non-fragile hardening;
+- install the `watch` compatibility wrapper;
+- run lightweight deterministic self-checks;
+- avoid an endless restart loop when token/admin config is missing;
+- not contact Telegram automatically unless operator explicitly validates token or sends a test alert;
 - finish by telling the operator to run `watch`.
 
-A public-repo one-liner from README must work after `install.sh` exists.
+After valid configuration, the menu may enable/start/restart the service explicitly.
 
 ## Tests / acceptance
 
 Cover at least:
 
-- first baseline produces no NEW alerts;
-- new ID produces exactly one durable alert event;
-- restart/re-poll does not duplicate that event;
-- ordering changes produce no event;
-- price/count changes produce clear events;
-- failed alert remains pending and retries;
-- 429 uses `retry_after`;
-- non-admin cannot use Telegram admin controls;
-- invalid token/admin/interval config fails closed;
-- wrapper with arguments delegates to original system watch;
-- installer passes `bash -n` and is idempotent in its file-generation logic.
+- first baseline -> zero NEW events;
+- new ID -> exactly one durable NEW event;
+- crash/restart/re-poll -> no duplicate queued NEW event;
+- atomicity: snapshot cannot advance without its associated event transaction committing;
+- ordering-only changes -> no event;
+- price/total/personal-limit changes -> durable event;
+- routine global remaining decrement -> no alert spam;
+- restock/increase and zero/sold-out transition -> alertable event;
+- one-poll disappearance -> no removal alert; two successful misses -> one removal event;
+- failed poll does not advance missing counter/baseline;
+- failed alert stays pending and retries;
+- 429 honors `retry_after`;
+- watcher OFF still allows pending alert delivery;
+- baseline rebuild failure preserves old baseline;
+- non-admin cannot use any admin callback;
+- invalid token/admin/interval fails closed;
+- concurrent service/CLI SQLite access respects `busy_timeout` and ownership assumptions;
+- wrapper args delegate exactly to system watch;
+- `bash -n install.sh` passes and installer file-generation behavior is idempotent.
 
-Create `scripts/check.sh` that runs deterministic local checks (compile, tests, shell syntax; lint only if added as a dependency). GitHub CI should call this script on Python 3.12.
+Create `scripts/check.sh` for deterministic local checks: compile, pytest, shell syntax and lint only if lint is an explicit dependency. GitHub CI should call the same script on Python 3.12.
 
 ## Guardrails
 
-Do not add purchasing, Stars balance/spend, Redis/PostgreSQL, Docker orchestration, web dashboard, user accounts, plugin system, distributed workers, or abstractions not required above.
+No purchasing, Stars balance/spend, Redis/PostgreSQL, Docker orchestration, web dashboard, user accounts, plugin system or distributed workers.
 
 Do not deploy, restart a real host, merge main, or use a live Bot Token during implementation.
 
 ## Final report
 
-Report: architecture chosen, files added, checks run and exact pass/fail counts, installer behavior, `watch` compatibility behavior, and any known limitation. If any acceptance item is not proven, state it explicitly instead of declaring complete.
+Report architecture, files added, exact checks/pass-fail counts, installer behavior, `watch` compatibility behavior and known limitations. If an acceptance item is not proven, state that explicitly instead of declaring complete.
