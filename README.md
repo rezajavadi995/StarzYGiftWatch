@@ -6,14 +6,15 @@ It uses the official Bot API `getAvailableGifts`, keeps a durable local baseline
 
 ## v1 scope
 
-- New Gift ID detection as the highest-priority event.
-- Meaningful changes: price, `total_count`, `remaining_count`, `personal_total_count`, `personal_remaining_count`, availability/removal, and newly exposed serializable Gift fields.
+- New Gift ID detection is the highest-priority event.
+- Meaningful changes include price, total supply, personal limits, availability/sold-out/restock and newly exposed stable Gift fields.
+- Routine global `remaining_count` decrements are observed but are not allowed to spam an alert every poll.
 - Durable baseline/event history across restarts.
-- Telegram admin panel and a local terminal admin menu.
+- Telegram admin panel + local terminal admin menu.
 - One process + SQLite. No Redis/PostgreSQL/NATS.
 - No purchasing, wallet, Stars spending, userbot, API ID/Hash, or user session.
 
-Official Bot API currently exposes `getAvailableGifts` without parameters and returns `Gift` objects including optional global and per-bot limited-supply counts.
+Telegram's official Bot API exposes `getAvailableGifts` without parameters. Current `Gift` objects include `star_count`, optional global limited-supply counts (`total_count`, `remaining_count`) and optional per-bot counts (`personal_total_count`, `personal_remaining_count`).
 
 ## Platform
 
@@ -21,13 +22,13 @@ Ubuntu/Debian, Python 3.12+, systemd.
 
 ## One-line installer
 
-The initial implementation will provide `install.sh`. Until that file lands, do not run this command.
+The implementation will provide `install.sh`. Until that file lands, do not run this command.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rezajavadi995/StarzYGiftWatch/main/install.sh | sudo bash
 ```
 
-The installer must be idempotent and isolated. It may manage only StarzYGiftWatch-owned paths/services and must never modify StarzYFire.
+The installer is required to be idempotent and isolated. It may manage only StarzYGiftWatch-owned paths/services and must never modify StarzYFire.
 
 ## Terminal admin menu
 
@@ -37,10 +38,12 @@ After installation:
 watch
 ```
 
-Ubuntu/Debian already provides `/usr/bin/watch`. We do **not** overwrite/delete it. The installer creates `/usr/local/bin/watch` as a compatibility wrapper:
+Ubuntu/Debian already provides `/usr/bin/watch`. We do **not** overwrite or delete it. The installer creates `/usr/local/bin/watch`:
 
 - no arguments -> StarzYGiftWatch admin/config menu;
 - any arguments -> delegate unchanged to the original system `watch` binary.
+
+If the shell had previously cached `/usr/bin/watch`, start a new shell or run `hash -r` once.
 
 Minimum menu:
 
@@ -60,15 +63,21 @@ Secrets are never printed in full.
 
 ## Telegram admin panel
 
-Only `ADMIN_ID` is authorized. Minimum controls: watcher ON/OFF, status/last success, poll interval, current gifts, recent changes, test alert, and confirmed baseline rebuild.
+Only `ADMIN_ID` is authorized, and authorization is checked on every command/callback. Minimum controls: watcher ON/OFF, status/last success, poll interval, current gifts, recent changes, test alert and confirmed baseline rebuild.
 
 ## Detection rules
 
-The first successful poll creates the baseline and sends **no fake NEW alerts** for existing gifts. Later successful polls compare canonical normalized snapshots. Ordering alone must not create events.
+The first successful poll creates the baseline and sends **no fake NEW alerts** for existing gifts. Later successful polls compare canonical snapshots keyed by Gift ID; ordering alone creates no event.
 
-Persist each event before attempting its Telegram alert. Durable deduplication must prevent repeated alerts after restart. Failed alerts retry with bounded backoff and Telegram `retry_after` must be honored.
+New IDs alert immediately. Removal is confirmed only after two consecutive successful polls miss the same ID. Failed polls never count toward removal confirmation.
+
+For each successful catalog, durable event creation/deduplication and snapshot advancement are committed atomically. This prevents a crash from saving the new baseline while losing its alert event.
+
+Events are persisted before Telegram delivery. Failed alerts retry with bounded backoff and Telegram `retry_after` is honored. Delivery is intentionally at-least-once: a crash after Telegram accepted an alert but before SQLite marked it sent can cause one duplicate.
 
 ## Configuration
+
+Static/bootstrap configuration:
 
 ```text
 /etc/starzygiftwatch.env
@@ -77,12 +86,11 @@ Persist each event before attempting its Telegram alert. Durable deduplication m
 ```dotenv
 BOT_TOKEN=
 ADMIN_ID=
-POLL_INTERVAL=5
 DATABASE_PATH=/opt/starzygiftwatch/data/watch.db
 LOG_LEVEL=INFO
 ```
 
-`POLL_INTERVAL` is validated; default is 5 seconds. Telegram documents general flood limits but no dedicated `getAvailableGifts` polling limit, so the watcher must handle 429s conservatively.
+Mutable runtime settings such as watcher ON/OFF and poll interval live in SQLite so the Telegram panel and terminal `watch` menu use one source of truth. Default poll interval is 5 seconds; accepted range is 2..3600 seconds.
 
 ## Runtime layout
 
@@ -93,7 +101,7 @@ LOG_LEVEL=INFO
 /usr/local/bin/watch
 ```
 
-SQLite uses WAL mode and short transactions. No network I/O while holding a write transaction.
+SQLite uses WAL, foreign keys, a practical busy timeout and short transactions. Network I/O is never performed while a SQLite write transaction is held.
 
 ## Agent contract
 
