@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
+import random
 import json
 import time
 from typing import Any, Iterable
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramRetryAfter
 
 from . import db
+
+LOGGER = logging.getLogger(__name__)
 
 STABLE_FIELDS = {
     "id", "star_count", "upgrade_star_count", "is_limited", "is_sold_out", "is_premium",
@@ -125,9 +130,38 @@ async def rebuild_baseline(conn, bot: Bot) -> None:
         conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('last_success',?)", (str(now),))
 
 
+def backoff_delay(attempt: int, retry_after: float | None = None, *, cap: float = 300.0) -> float:
+    if retry_after is not None:
+        return max(0.0, float(retry_after))
+    return min(cap, 2 ** min(attempt, 8)) + random.uniform(0, 1)
+
+
+async def poll_once(conn, bot: Bot) -> bool:
+    catalog = await fetch_catalog(bot)
+    event_ids = apply_catalog(conn, catalog)
+    db.record_poll_success(conn, len(catalog), event_ids)
+    return True
+
+
 async def watcher_loop(conn, bot: Bot) -> None:
+    failures = 0
     while True:
-        if db.watcher_enabled(conn):
-            catalog = await fetch_catalog(bot)
-            apply_catalog(conn, catalog)
-        await asyncio.sleep(db.poll_interval(conn))
+        try:
+            if db.watcher_enabled(conn):
+                await poll_once(conn, bot)
+                failures = 0
+            await asyncio.sleep(db.poll_interval(conn))
+        except TelegramRetryAfter as exc:
+            failures += 1
+            delay = backoff_delay(failures, exc.retry_after)
+            LOGGER.warning("Telegram getAvailableGifts rate limited; retrying in %.1fs", delay)
+            db.record_poll_failure(conn, f"Telegram retry_after={exc.retry_after}")
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures += 1
+            delay = backoff_delay(failures)
+            LOGGER.exception("Gift polling failed; preserving previous baseline and retrying in %.1fs", delay)
+            db.record_poll_failure(conn, f"{type(exc).__name__}: {exc}")
+            await asyncio.sleep(delay)

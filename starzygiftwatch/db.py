@@ -103,3 +103,48 @@ def mark_sent(conn: sqlite3.Connection, event_id: int) -> None:
 def mark_retry(conn: sqlite3.Connection, event_id: int, delay: float) -> None:
     with transaction(conn):
         conn.execute("UPDATE events SET attempts=attempts+1,next_attempt_at=? WHERE id=?", (time.time() + delay, event_id))
+
+
+def set_health(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES(?,?)", (key, value))
+
+
+def set_health_many(conn: sqlite3.Connection, values: dict[str, str]) -> None:
+    with transaction(conn):
+        for key, value in values.items():
+            set_health(conn, key, value)
+
+
+def get_health(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM health WHERE key=?", (key,)).fetchone()
+    return default if row is None else row["value"]
+
+
+def record_runtime_status(conn: sqlite3.Connection, status: str, message: str = "") -> None:
+    set_health_many(conn, {"runtime_status": status, "runtime_message": message, "runtime_updated_at": str(time.time())})
+
+
+def record_poll_success(conn: sqlite3.Connection, gift_count: int, new_event_ids: list[int]) -> None:
+    updates = {"last_success": str(time.time()), "gift_count": str(gift_count), "runtime_status": "OK", "runtime_message": ""}
+    if new_event_ids:
+        row = conn.execute("SELECT gift_id FROM events WHERE id=?", (new_event_ids[0],)).fetchone()
+        if row:
+            updates["last_new_gift_id"] = row["gift_id"] or ""
+    set_health_many(conn, updates)
+
+
+def record_poll_failure(conn: sqlite3.Connection, message: str) -> None:
+    safe = message[:500]
+    set_health_many(conn, {"last_error": safe, "last_error_at": str(time.time()), "runtime_status": "POLL_ERROR", "runtime_message": safe})
+
+
+def needs_configuration(conn: sqlite3.Connection, bot_token: str, admin_id: int | None) -> bool:
+    missing = []
+    if not bot_token:
+        missing.append("BOT_TOKEN")
+    if not admin_id:
+        missing.append("ADMIN_ID")
+    if missing:
+        record_runtime_status(conn, "NEEDS_CONFIGURATION", "missing " + ",".join(missing))
+        return True
+    return False

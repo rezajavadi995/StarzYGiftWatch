@@ -22,8 +22,9 @@ ADMIN_ID=
 DATABASE_PATH=/opt/starzygiftwatch/data/watch.db
 LOG_LEVEL=INFO
 ENV
-  chmod 600 /etc/starzygiftwatch.env
 fi
+chown root:starzygiftwatch /etc/starzygiftwatch.env
+chmod 600 /etc/starzygiftwatch.env
 cat > /etc/systemd/system/starzygiftwatch.service <<'UNIT'
 [Unit]
 Description=StarzYGiftWatch Telegram Gift watcher

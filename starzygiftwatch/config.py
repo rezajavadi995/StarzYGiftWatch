@@ -57,6 +57,21 @@ def validate_interval(value: int) -> int:
     return value
 
 
+def write_env_file(updates: dict[str, str], path: str = "/etc/starzygiftwatch.env") -> None:
+    current: dict[str, str] = {
+        "BOT_TOKEN": "",
+        "ADMIN_ID": "",
+        "DATABASE_PATH": "/opt/starzygiftwatch/data/watch.db",
+        "LOG_LEVEL": "INFO",
+    }
+    current.update(_read_env_file(path))
+    current.update(updates)
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(f"{k}={v}" for k, v in current.items() if k in {"BOT_TOKEN", "ADMIN_ID", "DATABASE_PATH", "LOG_LEVEL"}) + "\n")
+    p.chmod(0o600)
+
+
 def load_config(env_file: str = "/etc/starzygiftwatch.env") -> Config:
     file_values = _read_env_file(env_file)
     values = {**file_values, **{k: v for k, v in os.environ.items() if k in {"BOT_TOKEN", "ADMIN_ID", "DATABASE_PATH", "LOG_LEVEL"}}}

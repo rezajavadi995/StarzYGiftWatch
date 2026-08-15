@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -107,3 +108,153 @@ def test_concurrent_busy_timeout(tmp_path):
 def test_non_admin_callback_has_no_controls():
     r = build_router(sqlite3.connect(":memory:"), 1)
     assert r is not None
+
+
+def test_polling_failure_preserves_baseline_and_later_recovers(tmp_path):
+    from starzygiftwatch.watcher import poll_once
+
+    c = conn(tmp_path)
+    apply_catalog(c, {"1": gift("1")})
+
+    class FlakyBot:
+        def __init__(self): self.calls = 0
+        async def get_available_gifts(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary telegram error")
+            return [gift("1"), gift("2")]
+
+    bot = FlakyBot()
+    with pytest.raises(RuntimeError):
+        asyncio.run(poll_once(c, bot))
+    assert set(db.current_snapshots(c)) == {"1"}
+    asyncio.run(poll_once(c, bot))
+    assert set(db.current_snapshots(c)) == {"1", "2"}
+    assert db.get_health(c, "runtime_status") == "OK"
+
+
+def test_watcher_loop_survives_temporary_polling_failure(tmp_path, monkeypatch):
+    from starzygiftwatch import watcher
+
+    c = conn(tmp_path)
+    apply_catalog(c, {"1": gift("1")})
+
+    class FlakyBot:
+        def __init__(self): self.calls = 0
+        async def get_available_gifts(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary telegram error")
+            return [gift("1"), gift("2")]
+
+    sleeps = {"n": 0}
+
+    async def fake_sleep(delay):
+        sleeps["n"] += 1
+        if sleeps["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(watcher.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(watcher.watcher_loop(c, FlakyBot()))
+    assert set(db.current_snapshots(c)) == {"1", "2"}
+    assert "temporary telegram error" in db.get_health(c, "last_error")
+
+
+def test_watcher_retry_after_delay_is_used(tmp_path, monkeypatch):
+    from aiogram.exceptions import TelegramRetryAfter
+    from starzygiftwatch import watcher
+
+    c = conn(tmp_path)
+    delays = []
+
+    class RateLimitedBot:
+        async def get_available_gifts(self):
+            raise TelegramRetryAfter(method="getAvailableGifts", message="retry", retry_after=4)
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(watcher.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(watcher.watcher_loop(c, RateLimitedBot()))
+    assert delays == [4]
+    assert "retry_after=4" in db.get_health(c, "last_error")
+
+
+def test_alert_loop_survives_worker_error(tmp_path, monkeypatch):
+    from starzygiftwatch import alerts
+
+    c = conn(tmp_path)
+    calls = {"n": 0}
+
+    async def fake_deliver(conn_arg, bot, admin_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db temporarily busy")
+        return 0
+
+    async def fake_sleep(delay):
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(alerts, "deliver_pending_once", fake_deliver)
+    monkeypatch.setattr(alerts.asyncio, "sleep", fake_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(alerts.alert_loop(c, Bot(), 123))
+    assert calls["n"] == 2
+
+
+def test_needs_configuration_status(tmp_path):
+    c = conn(tmp_path)
+    assert db.needs_configuration(c, "", None) is True
+    assert db.get_health(c, "runtime_status") == "NEEDS_CONFIGURATION"
+    assert "BOT_TOKEN" in db.get_health(c, "runtime_message")
+
+
+def test_cli_credential_save_is_durable_and_requests_restart(tmp_path, monkeypatch):
+    from starzygiftwatch import cli
+    from starzygiftwatch.config import load_config
+
+    env_file = tmp_path / "starzygiftwatch.env"
+    monkeypatch.setattr(cli, "ENV_PATH", env_file)
+
+    calls = []
+    def fake_run_service_command(*args):
+        calls.append(args)
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return Result()
+
+    monkeypatch.setattr(cli, "run_service_command", fake_run_service_command)
+    msg = cli.save_credentials({"BOT_TOKEN": "123456:ABC", "ADMIN_ID": "777"})
+    loaded = load_config(str(env_file))
+    assert loaded.bot_token == "123456:ABC"
+    assert loaded.admin_id == 777
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    assert calls == [("restart",)]
+    assert "restarted" in msg
+
+
+def test_cli_status_reports_required_fields(tmp_path, monkeypatch):
+    from starzygiftwatch import cli
+    from starzygiftwatch.config import Config
+
+    c = conn(tmp_path)
+    db.record_runtime_status(c, "NEEDS_CONFIGURATION", "missing BOT_TOKEN")
+    monkeypatch.setattr(cli, "service_state", lambda: "inactive")
+    lines = cli.status_lines(c, Config(bot_token="", admin_id=None, database_path=str(tmp_path / "w.db")))
+    rendered = "\n".join(lines)
+    assert "Status: NEEDS_CONFIGURATION" in rendered
+    assert "Bot Token: (unset)" in rendered
+    assert "Admin ID: (unset)" in rendered
+    assert "Last successful poll: never" in rendered
+
+
+def test_watch_wrapper_can_run_from_outside_repo(tmp_path):
+    import subprocess
+    result = subprocess.run(["bash", str(Path(__file__).with_name("wrapper_test.sh"))], cwd=tmp_path, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr + result.stdout
