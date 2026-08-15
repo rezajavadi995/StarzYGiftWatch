@@ -81,6 +81,7 @@ UNIT
 cat > /usr/local/bin/watch <<'WRAP'
 #!/usr/bin/env bash
 if [[ $# -gt 0 ]]; then exec /usr/bin/watch "$@"; fi
+cd /opt/starzygiftwatch
 exec /opt/starzygiftwatch/.venv/bin/python -m starzygiftwatch.cli
 WRAP
 chmod +x /usr/local/bin/watch
