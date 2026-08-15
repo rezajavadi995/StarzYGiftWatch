@@ -95,7 +95,23 @@ acquire_repository() {
 }
 
 stage="privilege check"
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then exec sudo bash "$0" "$@"; fi
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo env \
+    "STARZYGIFTWATCH_REPO_URL=$REPO_URL" \
+    "STARZYGIFTWATCH_APP_DIR=$APP_DIR" \
+    "STARZYGIFTWATCH_ENV_FILE=$ENV_FILE" \
+    "STARZYGIFTWATCH_SERVICE_FILE=$SERVICE_FILE" \
+    "STARZYGIFTWATCH_WATCH_WRAPPER=$WATCH_WRAPPER" \
+    "STARZYGIFTWATCH_SYSTEM_WATCH=$SYSTEM_WATCH" \
+    "STARZYGIFTWATCH_SERVICE_USER=$SERVICE_USER" \
+    "STARZYGIFTWATCH_PYTHON=$PYTHON_BIN" \
+    "STARZYGIFTWATCH_SKIP_APT=$SKIP_APT" \
+    "STARZYGIFTWATCH_SKIP_USER=$SKIP_USER" \
+    "STARZYGIFTWATCH_SKIP_SYSTEMD=$SKIP_SYSTEMD" \
+    "STARZYGIFTWATCH_SKIP_PIP=$SKIP_PIP" \
+    "STARZYGIFTWATCH_VENV_ARGS=$VENV_ARGS" \
+    bash "$0" "$@"
+fi
 
 stage="platform/package checks"
 if [[ "$SKIP_APT" != "1" ]] && ! command -v apt-get >/dev/null; then fail "Ubuntu/Debian with apt-get required"; fi
