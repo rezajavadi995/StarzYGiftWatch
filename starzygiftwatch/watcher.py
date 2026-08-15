@@ -61,7 +61,7 @@ def _event(event_type: str, gift_id: str, payload: dict[str, Any], alertable: bo
 def diff_gift(old: dict, new: dict) -> list[tuple[str, str, dict, int]]:
     gid = new["id"]
     events = []
-    for field in ("star_count", "upgrade_star_count", "total_count", "personal_total_count", "personal_remaining_count"):
+    for field in ("star_count", "upgrade_star_count", "total_count"):
         if old.get(field) != new.get(field):
             events.append(_event("CHANGE", gid, {"field": field, "old": old.get(field), "new": new.get(field)}))
     old_remaining, new_remaining = old.get("remaining_count"), new.get("remaining_count")
@@ -83,9 +83,13 @@ def apply_catalog(conn, catalog: dict[str, dict[str, Any]]) -> list[int]:
     old = db.current_snapshots(conn)
     inserted: list[int] = []
     with db.transaction(conn):
-        if not old:
+        if not catalog:
+            conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('last_success',?)", (str(now),))
+            return []
+        if not old and db.get_health(conn, "baseline_initialized") != "1":
             for gid, snap in catalog.items():
                 conn.execute("INSERT OR REPLACE INTO gifts(id,snapshot,missing_count,updated_at) VALUES(?,?,0,?)", (gid, json.dumps(snap, sort_keys=True), now))
+            conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('baseline_initialized','1')")
             conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('last_success',?)", (str(now),))
             return []
         for gid, snap in catalog.items():

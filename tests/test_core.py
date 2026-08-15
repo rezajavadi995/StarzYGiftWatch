@@ -38,9 +38,9 @@ def test_ordering_only_no_event(tmp_path):
     c=conn(tmp_path); apply_catalog(c,{"1":gift("1"),"2":gift("2")}); apply_catalog(c,{"2":gift("2"),"1":gift("1")}); assert events(c)==[]
 
 
-def test_price_total_personal_change(tmp_path):
-    c=conn(tmp_path); apply_catalog(c,{"1":gift("1")}); apply_catalog(c,{"1":gift("1", star_count=12,total_count=11,personal_total_count=2)})
-    assert len(events(c)) >= 3
+def test_price_total_change(tmp_path):
+    c=conn(tmp_path); apply_catalog(c,{"1":gift("1")}); apply_catalog(c,{"1":gift("1", star_count=12,total_count=11)})
+    assert len(events(c)) == 2
 
 
 def test_remaining_decrement_no_alert_restock_zero_alert(tmp_path):
@@ -51,9 +51,9 @@ def test_remaining_decrement_no_alert_restock_zero_alert(tmp_path):
 
 
 def test_removal_requires_two_successes_and_failure_no_advance(tmp_path):
-    c=conn(tmp_path); apply_catalog(c,{"1":gift("1")}); apply_catalog(c,{}) ; assert events(c)==[]
+    c=conn(tmp_path); apply_catalog(c,{"1":gift("1"), "2": gift("2")}); apply_catalog(c,{"2": gift("2")}) ; assert events(c)==[]
     # failed poll means no apply_catalog call; second successful miss removes
-    apply_catalog(c,{}) ; ev=events(c); assert len(ev)==1 and ev[0]["event_type"]=="REMOVED"
+    apply_catalog(c,{"2": gift("2")}) ; ev=events(c); assert len(ev)==1 and ev[0]["event_type"]=="REMOVED"
 
 
 def test_atomicity_rolls_back_snapshot_with_event(tmp_path):
@@ -258,3 +258,65 @@ def test_watch_wrapper_can_run_from_outside_repo(tmp_path):
     import subprocess
     result = subprocess.run(["bash", str(Path(__file__).with_name("wrapper_test.sh"))], cwd=tmp_path, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr + result.stdout
+
+def test_empty_first_poll_then_nonempty_builds_baseline_then_later_new_alerts(tmp_path):
+    c = conn(tmp_path)
+    assert apply_catalog(c, {}) == []
+    assert events(c) == []
+    assert apply_catalog(c, {"1": gift("1")}) == []
+    assert events(c) == []
+    assert set(db.current_snapshots(c)) == {"1"}
+
+    inserted = apply_catalog(c, {"1": gift("1"), "2": gift("2")})
+    ev = events(c)
+    assert len(inserted) == 1
+    assert len(ev) == 1 and ev[0]["event_type"] == "NEW" and ev[0]["gift_id"] == "2"
+
+
+def test_valid_baseline_empty_poll_preserves_snapshot(tmp_path):
+    c = conn(tmp_path)
+    apply_catalog(c, {"1": gift("1")})
+    apply_catalog(c, {})
+    assert events(c) == []
+    assert set(db.current_snapshots(c)) == {"1"}
+
+
+def test_restart_with_valid_baseline_no_fake_new(tmp_path):
+    path = tmp_path / "w.db"
+    c = db.connect(str(path)); db.init_db(c)
+    apply_catalog(c, {"1": gift("1")})
+    c.close()
+    c = db.connect(str(path)); db.init_db(c)
+    apply_catalog(c, {"1": gift("1")})
+    assert events(c) == []
+
+
+def test_first_nonempty_catalog_builds_baseline_without_alert(tmp_path):
+    c = conn(tmp_path)
+    assert apply_catalog(c, {"1": gift("1")}) == []
+    assert events(c) == []
+    assert set(db.current_snapshots(c)) == {"1"}
+
+
+def test_personal_remaining_only_change_no_event_but_snapshot_updates(tmp_path):
+    c = conn(tmp_path)
+    apply_catalog(c, {"1": gift("1", personal_remaining_count=3)})
+    apply_catalog(c, {"1": gift("1", personal_remaining_count=2)})
+    assert events(c) == []
+    assert db.current_snapshots(c)["1"]["personal_remaining_count"] == 2
+
+
+def test_personal_total_only_change_no_event(tmp_path):
+    c = conn(tmp_path)
+    apply_catalog(c, {"1": gift("1", personal_total_count=3)})
+    apply_catalog(c, {"1": gift("1", personal_total_count=4)})
+    assert events(c) == []
+
+
+def test_important_change_with_personal_remaining_has_single_needed_alert(tmp_path):
+    c = conn(tmp_path)
+    apply_catalog(c, {"1": gift("1", star_count=10, personal_remaining_count=3)})
+    apply_catalog(c, {"1": gift("1", star_count=11, personal_remaining_count=2)})
+    ev = events(c)
+    assert len(ev) == 1
+    assert ev[0]["event_type"] == "CHANGE"
