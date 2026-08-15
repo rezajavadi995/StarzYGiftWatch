@@ -259,15 +259,18 @@ def test_watch_wrapper_can_run_from_outside_repo(tmp_path):
     result = subprocess.run(["bash", str(Path(__file__).with_name("wrapper_test.sh"))], cwd=tmp_path, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr + result.stdout
 
-def test_empty_first_poll_then_nonempty_alerts_new(tmp_path):
+def test_empty_first_poll_then_nonempty_builds_baseline_then_later_new_alerts(tmp_path):
     c = conn(tmp_path)
     assert apply_catalog(c, {}) == []
     assert events(c) == []
-    inserted = apply_catalog(c, {"1": gift("1")})
+    assert apply_catalog(c, {"1": gift("1")}) == []
+    assert events(c) == []
+    assert set(db.current_snapshots(c)) == {"1"}
+
+    inserted = apply_catalog(c, {"1": gift("1"), "2": gift("2")})
     ev = events(c)
     assert len(inserted) == 1
-    assert len(ev) == 1 and ev[0]["event_type"] == "NEW"
-    assert set(db.current_snapshots(c)) == {"1"}
+    assert len(ev) == 1 and ev[0]["event_type"] == "NEW" and ev[0]["gift_id"] == "2"
 
 
 def test_valid_baseline_empty_poll_preserves_snapshot(tmp_path):

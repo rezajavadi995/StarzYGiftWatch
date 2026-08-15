@@ -85,22 +85,13 @@ def apply_catalog(conn, catalog: dict[str, dict[str, Any]]) -> list[int]:
     with db.transaction(conn):
         if not catalog:
             conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('last_success',?)", (str(now),))
-            if not old and db.get_health(conn, "baseline_initialized") != "1":
-                conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('empty_catalog_seen_before_baseline','1')")
             return []
         if not old and db.get_health(conn, "baseline_initialized") != "1":
-            should_alert_new = db.get_health(conn, "empty_catalog_seen_before_baseline") == "1"
             for gid, snap in catalog.items():
-                if should_alert_new:
-                    fp, etype, payload, alertable = _event("NEW", gid, {"gift": snap})
-                    cur = conn.execute("INSERT OR IGNORE INTO events(fingerprint,gift_id,event_type,payload,alertable,created_at) VALUES(?,?,?,?,?,?)", (fp, gid, etype, json.dumps(payload, sort_keys=True), alertable, now))
-                    if cur.rowcount:
-                        inserted.append(cur.lastrowid)
                 conn.execute("INSERT OR REPLACE INTO gifts(id,snapshot,missing_count,updated_at) VALUES(?,?,0,?)", (gid, json.dumps(snap, sort_keys=True), now))
             conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('baseline_initialized','1')")
-            conn.execute("DELETE FROM health WHERE key='empty_catalog_seen_before_baseline'")
             conn.execute("INSERT OR REPLACE INTO health(key,value) VALUES('last_success',?)", (str(now),))
-            return inserted
+            return []
         for gid, snap in catalog.items():
             if gid not in old:
                 events = [_event("NEW", gid, {"gift": snap})]
